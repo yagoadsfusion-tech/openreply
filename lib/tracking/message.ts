@@ -66,6 +66,25 @@ export function buildTrackedUrl(
   return recipientToken ? `${url}?r=${recipientToken}` : url;
 }
 
+/**
+ * With DIRECT_LINK_URLS=true, recipients get each link's destination URL as-is
+ * instead of the /r/<slug> redirect, so this instance's domain never shows up
+ * in a DM. Clicks are then not counted here; measure them at the destination.
+ */
+export function directLinkUrlsEnabled(): boolean {
+  return process.env.DIRECT_LINK_URLS === "true";
+}
+
+export function buildRecipientUrl(
+  link: MessageTrackedLink,
+  baseUrl?: string,
+  recipientToken?: string
+) {
+  return directLinkUrlsEnabled()
+    ? link.destinationUrl
+    : buildTrackedUrl(link.slug, baseUrl, recipientToken);
+}
+
 export function renderMessageWithTracking({
   message,
   commenterName,
@@ -84,7 +103,7 @@ export function renderMessageWithTracking({
 
   if (!primaryLink) return rendered;
 
-  const trackedUrl = buildTrackedUrl(primaryLink.slug, baseUrl, recipientToken);
+  const trackedUrl = buildRecipientUrl(primaryLink, baseUrl, recipientToken);
 
   if (/\{link\}/i.test(rendered)) {
     return rendered.replace(/\{link\}/gi, trackedUrl);

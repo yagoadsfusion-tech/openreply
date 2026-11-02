@@ -600,6 +600,39 @@ describe("DM Worker — Full Pipeline", () => {
     );
   });
 
+  it("should point link buttons straight at the destination when DIRECT_LINK_URLS=true", async () => {
+    vi.stubEnv("DIRECT_LINK_URLS", "true");
+    mockPrisma.automation.findMany.mockResolvedValue([
+      {
+        ...mockAutomation,
+        dmMessage: "Escolhe aí embaixo {link}",
+        linkButtonLabel: "Baixar o app",
+        trackedLinks: [
+          {
+            slug: "abc123",
+            label: "Primary campaign link",
+            destinationUrl: "https://example.com/app1",
+          },
+        ],
+      },
+    ]);
+
+    try {
+      const processor = getProcessor();
+      await processor(createMockJob());
+    } finally {
+      vi.unstubAllEnvs();
+    }
+
+    expect(mockSendPrivateReplyWithLinkButton).toHaveBeenCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "comment_555",
+      "Escolhe aí embaixo",
+      [{ title: "Baixar o app", url: "https://example.com/app1" }]
+    );
+  });
+
   it("should send a follow-gate prompt when a non-follower comments", async () => {
     mockGetUserFollowStatus.mockResolvedValue(false); // not following yet
     mockPrisma.automation.findMany.mockResolvedValue([

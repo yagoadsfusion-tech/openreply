@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   calculateCtr,
   countUniqueClicks,
@@ -8,6 +8,7 @@ import {
 } from "../lib/tracking/analytics";
 import { hashRecipientId, parseRecipientToken } from "../lib/tracking/server";
 import {
+  buildRecipientUrl,
   buildTrackedUrl,
   extractFirstUrl,
   renderMessageWithTracking,
@@ -79,6 +80,36 @@ describe("tracked link messages", () => {
     expect(buildTrackedUrl("abc123", "https://manychat-alternative.com/")).toBe(
       "https://manychat-alternative.com/r/abc123"
     );
+  });
+});
+
+describe("direct link URLs", () => {
+  const link = { slug: "abc123", destinationUrl: "https://example.com/app1" };
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("keeps the tracked redirect when DIRECT_LINK_URLS is unset", () => {
+    expect(
+      buildRecipientUrl(link, "https://manychat-alternative.com", "tok")
+    ).toBe("https://manychat-alternative.com/r/abc123?r=tok");
+  });
+
+  it("sends the destination URL as-is when DIRECT_LINK_URLS=true", () => {
+    vi.stubEnv("DIRECT_LINK_URLS", "true");
+
+    expect(
+      buildRecipientUrl(link, "https://manychat-alternative.com", "tok")
+    ).toBe("https://example.com/app1");
+    expect(
+      renderMessageWithTracking({
+        message: "Grab it here: {link}",
+        trackedLinks: [link],
+        baseUrl: "https://manychat-alternative.com",
+        recipientToken: "tok",
+      })
+    ).toBe("Grab it here: https://example.com/app1");
   });
 });
 
