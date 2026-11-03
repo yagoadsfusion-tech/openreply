@@ -273,6 +273,61 @@ async function sendRevealDirectMessage({
 }
 
 
+// OPENING_TEXT_QUICK_REPLY=true sends the opening DM (the private reply) as
+// plain text with its button label as a quick reply, instead of a button
+// template. On a new account Instagram refused most button-template private
+// replies to strangers (code 2, sub 1545133), and a fork that measured it saw
+// ~99% of plain-text first messages arrive against ~41% with the button. A tap
+// on the quick reply comes back as an ordinary message, and so does any other
+// reply, so the account remembers who got a text opening and the next message
+// from that person delivers the campaign's link whatever it says.
+function openingTextQuickReply(): boolean {
+  return process.env.OPENING_TEXT_QUICK_REPLY === "true";
+}
+// A reply can come days after the comment, and the private reply itself is
+// only allowed for 7 days, so the marker lasts as long.
+const TEXT_OPENING_TTL_MS = 7 * 24 * 3600_000;
+// Subcodes that refuse the reply itself rather than the quick replies. Matched
+// by number because Meta localizes the message text.
+const PRIVATE_REPLY_REFUSED_SUBCODES = [2534014, 2534022, 2534025];
+function textOpeningKey(instagramAccountId: string, userId: string): string {
+  return `text_opening:${instagramAccountId}:${userId}`;
+}
+async function markTextOpening(
+  instagramAccountId: string,
+  userId: string,
+  automationId: string
+): Promise<void> {
+  try {
+    await getRedisConnection().set(
+      textOpeningKey(instagramAccountId, userId),
+      automationId,
+      "PX",
+      TEXT_OPENING_TTL_MS
+    );
+  } catch (error) {
+    console.log("[DM Worker] Could not remember a text opening:", formatError(error));
+  }
+}
+async function pendingTextOpening(
+  instagramAccountId: string,
+  userId: string
+): Promise<string | null> {
+  try {
+    return (await getRedisConnection().get(textOpeningKey(instagramAccountId, userId))) || null;
+  } catch (error) {
+    console.log("[DM Worker] Could not read a text opening:", formatError(error));
+    return null;
+  }
+}
+async function clearTextOpening(instagramAccountId: string, userId: string): Promise<void> {
+  try {
+    await getRedisConnection().del(textOpeningKey(instagramAccountId, userId));
+  } catch (error) {
+    console.log("[DM Worker] Could not clear a text opening:", formatError(error));
+  }
+}
+
 function connectionScope(data: DmQueueJob) {
   return data.accountConnectionId ? { instagramAccountId: data.accountConnectionId } : {};
 }
@@ -670,17 +725,55 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           commenterName,
           trackedLinks: [],
         });
-        await sendPrivateReplyWithButton({
-          context: accessToken,
-          instagramAccountId: automation.instagramAccount.instagramId,
-          commentId: commentId,
-          text: openingText,
-          buttonTitle: automation.openingDmButtonLabel as string,
-          // The ":open" marker tells a tap here apart from the follow prompt's
-          // own "I'm following" button, which sends the same prefix.
-          payload: `${automation.requireFollow ? "followcheck" : "reveal"}:${automation.id}:open`,
-          postId: mediaId,
-        });
+        if (openingTextQuickReply()) {
+          const quickReplies = [
+            {
+              title: automation.openingDmButtonLabel as string,
+              payload: `opening:${automation.id}`,
+            },
+          ];
+          const sendOpening = (withQuickReplies: typeof quickReplies) =>
+            sendPrivateReply({
+              context: accessToken,
+              instagramAccountId: automation.instagramAccount.instagramId,
+              commentId: commentId,
+              message: openingText,
+              postId: mediaId,
+              quickReplies: withQuickReplies,
+            });
+          try {
+            await sendOpening(quickReplies);
+          } catch (error) {
+            // Meta documents private replies as text only. If it turns the
+            // quick replies down as an invalid request, rather than refusing
+            // the reply itself, the text goes out alone.
+            if (
+              !(error instanceof MetaApiError) ||
+              error.code !== 100 ||
+              PRIVATE_REPLY_REFUSED_SUBCODES.includes(error.subcode ?? 0)
+            ) {
+              throw error;
+            }
+            console.log(
+              "[DM Worker] Quick replies refused, sending the opening as text:",
+              formatError(error)
+            );
+            await sendOpening([]);
+          }
+          await markTextOpening(instagramAccountId, commenterId, automation.id);
+        } else {
+          await sendPrivateReplyWithButton({
+            context: accessToken,
+            instagramAccountId: automation.instagramAccount.instagramId,
+            commentId: commentId,
+            text: openingText,
+            buttonTitle: automation.openingDmButtonLabel as string,
+            // The ":open" marker tells a tap here apart from the follow prompt's
+            // own "I'm following" button, which sends the same prefix.
+            payload: `${automation.requireFollow ? "followcheck" : "reveal"}:${automation.id}:open`,
+            postId: mediaId,
+          });
+        }
       } else if (sendFollowPrompt) {
         const promptText = renderMessageWithoutLink({
           message:
@@ -1280,10 +1373,14 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
 async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
   const { instagramAccountId, messageId, messageText, senderId } = job.data;
 
+  // A reply to a text opening (see openingTextQuickReply) continues that
+  // campaign whatever it says; anything else needs a keyword.
+  const continuedId = await pendingTextOpening(instagramAccountId, senderId);
+
   const automations = await prisma.automation.findMany({
     where: {
       ...connectionScope(job.data),
-      dmTriggerEnabled: true,
+      ...(continuedId ? { id: continuedId } : { dmTriggerEnabled: true }),
       isActive: true,
       instagramAccount: { instagramId: instagramAccountId },
     },
@@ -1301,7 +1398,7 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
   const dedupeId = `dm:${messageId}`;
 
   for (const automation of automations) {
-    const matchResult = automation.matchAnyWord
+    const matchResult = continuedId || automation.matchAnyWord
       ? { matched: true, matchedKeyword: null }
       : matchKeywords(
           messageText,
@@ -1502,6 +1599,7 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
           errorMessage: null,
         },
       });
+      if (continuedId) await clearTextOpening(instagramAccountId, senderId);
     } catch (error) {
       await releaseWorkspaceDMReservation(
         automation.workspaceId,

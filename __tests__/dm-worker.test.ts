@@ -70,14 +70,16 @@ vi.mock("@/lib/meta/client", () => ({
   sendCommentReply: vi.fn(),
   MetaApiError: class MetaApiError extends Error {
     code: number;
+    subcode: number | undefined;
     constructor(
       code: number,
-      _subcode: number | undefined,
+      subcode: number | undefined,
       _fbTraceId: string | undefined,
       message: string
     ) {
       super(message);
       this.code = code;
+      this.subcode = subcode;
       this.name = "MetaApiError";
     }
   },
@@ -1796,4 +1798,118 @@ it("retains the public reply claim if sending succeeded but its log write failed
   await process({ ...createMockJob(), id: "next-poll" });
   expect(sendCommentReply).toHaveBeenCalledTimes(1);
   expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+});
+
+describe("DM Worker — text opening with a quick reply", () => {
+  const openingAutomation = {
+    ...mockAutomation,
+    openingDmEnabled: true,
+    openingDmMessage: "Capivara prometeu, capivara manda.",
+    openingDmButtonLabel: "Quero o app",
+    requireFollow: false,
+    dmTriggerEnabled: true,
+    followPromptMessage: null,
+    followPromptButtonLabel: null,
+  };
+  const mockRedisSet = vi.fn();
+  const mockRedisGet = vi.fn();
+  const mockRedisDel = vi.fn();
+
+  beforeEach(() => {
+    process.env.OPENING_TEXT_QUICK_REPLY = "true";
+    mockRedisSet.mockReset().mockResolvedValue("OK");
+    mockRedisGet.mockReset().mockResolvedValue(null);
+    mockRedisDel.mockReset().mockResolvedValue(1);
+    vi.mocked(getRedisConnection).mockReturnValue({
+      set: mockRedisSet,
+      get: mockRedisGet,
+      del: mockRedisDel,
+    } as never);
+    mockPrisma.automation.findMany.mockResolvedValue([openingAutomation]);
+  });
+
+  afterEach(() => {
+    delete process.env.OPENING_TEXT_QUICK_REPLY;
+  });
+
+  it("sends the opening as plain text with a quick reply and remembers it", async () => {
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockSendPrivateReplyWithButton).not.toHaveBeenCalled();
+    expect(mockSendPrivateReply).toHaveBeenCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "comment_555",
+      "Capivara prometeu, capivara manda.",
+      [{ title: "Quero o app", payload: "opening:auto_789" }]
+    );
+    expect(mockRedisSet).toHaveBeenCalledWith(
+      "text_opening:ig_456:commenter_999",
+      "auto_789",
+      "PX",
+      7 * 24 * 3600_000
+    );
+  });
+
+  it("sends the text alone when Meta rejects the quick replies", async () => {
+    mockSendPrivateReply
+      .mockRejectedValueOnce(new MetaApiError(100, undefined, "trace", "Invalid parameter"))
+      .mockResolvedValueOnce({ recipient_id: "commenter_999", message_id: "msg_007" });
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(2);
+    expect(mockSendPrivateReply).toHaveBeenLastCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "comment_555",
+      "Capivara prometeu, capivara manda."
+    );
+    expect(mockRedisSet).toHaveBeenCalled();
+  });
+
+  it("does not resend when Meta refuses the private reply itself", async () => {
+    mockSendPrivateReply.mockRejectedValueOnce(
+      new MetaApiError(100, 2534025, "trace", "Tähän kommenttiin ei voi vastata")
+    );
+
+    const processor = getProcessor();
+    await processor(createMockJob()).catch(() => {});
+
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+    expect(mockRedisSet).not.toHaveBeenCalled();
+  });
+
+  it("delivers the link on any reply to a text opening, then forgets it", async () => {
+    mockRedisGet.mockResolvedValue("auto_789");
+    mockMatchKeywords.mockReturnValue({ matched: false, matchedKeyword: null });
+
+    const processor = getProcessor();
+    await processor({
+      name: "process-message",
+      data: {
+        instagramAccountId: "ig_456",
+        messageId: "mid_reply",
+        messageText: "Quero o app",
+        senderId: "commenter_999",
+      },
+      id: "message_job_002",
+      attemptsMade: 0,
+    });
+
+    expect(mockPrisma.automation.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "auto_789", isActive: true }),
+      })
+    );
+    expect(mockSendDirectMessage).toHaveBeenCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "commenter_999",
+      "Hey commenter_user! Here is the link: https://example.com"
+    );
+    expect(mockRedisDel).toHaveBeenCalledWith("text_opening:ig_456:commenter_999");
+  });
 });

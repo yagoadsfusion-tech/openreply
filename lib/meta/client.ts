@@ -165,7 +165,10 @@ export async function sendPrivateReply(
   accessToken: string,
   instagramAccountId: string,
   commentId: string,
-  message: string
+  message: string,
+  // Tappable suggestions under the text. Unlike a button template the message
+  // stays plain text, and a tap comes back as an ordinary message.
+  quickReplies: { title: string; payload: string }[] = []
 ): Promise<{ recipient_id: string; message_id: string }> {
   const response = await fetch(
     `${instagramGraphBase()}/${instagramAccountId}/messages`,
@@ -177,7 +180,18 @@ export async function sendPrivateReply(
       },
       body: JSON.stringify({
         recipient: { comment_id: commentId },
-        message: { text: message },
+        message: {
+          text: message,
+          ...(quickReplies.length > 0
+            ? {
+                quick_replies: quickReplies.slice(0, 13).map((q) => ({
+                  content_type: "text",
+                  title: q.title.slice(0, 20),
+                  payload: q.payload,
+                })),
+              }
+            : {}),
+        },
       }),
     }
   );
